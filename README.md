@@ -2,17 +2,23 @@
 
 Tools for analyzing macOS power metrics.
 
+## Install
+
+```bash
+ln -s $(pwd)/kenergy.sh ~/.local/bin/kenergy
+```
+
 ## Usage
 
 ```bash
 # Collect power metrics
-./kenergy.sh
+kenergy watch
 
-# Parse raw powermetrics output
-python3 parse-powermetrics.py
+# Analyze today's power data
+kenergy analyze
 
-# Analyze collected power data
-python3 analyze-power.py
+# Analyze power data for a specific date
+kenergy analyze 2026-01-15
 ```
 
 ## License
