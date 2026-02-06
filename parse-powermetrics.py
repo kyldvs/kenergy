@@ -13,11 +13,29 @@ import sys
 import json
 import re
 import argparse
+import signal
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 LOG_DIR = Path.home() / "kenergy" / "logs"
+
+# ── ANSI helpers ────────────────────────────────────────────────────
+
+_USE_COLOR = sys.stdout.isatty()
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
+BRIGHT_BLACK = "\033[90m"
+
+
+def style(text: str, *codes: str) -> str:
+    if not _USE_COLOR or not codes:
+        return str(text)
+    return "".join(codes) + str(text) + RESET
 
 
 def parse_timestamp(line: str) -> str | None:
@@ -168,17 +186,42 @@ def open_log_file(current_date: date) -> tuple[date, object]:
     return current_date, open(path, "a")
 
 
-def write_record(record: dict, today: date, f, start: float) -> tuple[date, object]:
+def fmt_ts(raw_ts: str) -> str:
+    """Format 'Fri Feb  6 12:15:26 2026 -0800' → '2026-02-06 12:15:26 PM -0800'."""
+    for fmt in ("%a %b %d %H:%M:%S %Y %z", "%a %b  %d %H:%M:%S %Y %z"):
+        try:
+            dt = datetime.strptime(raw_ts, fmt)
+            tz = dt.strftime("%z")  # e.g. "-0800"
+            return dt.strftime(f"%Y-%m-%d %I:%M:%S %p {tz}")
+        except ValueError:
+            continue
+    return raw_ts
+
+
+def fmt_now() -> str:
+    """Format current local time in the same style."""
+    dt = datetime.now().astimezone()
+    tz = dt.strftime("%z")
+    return dt.strftime(f"%Y-%m-%d %I:%M:%S %p {tz}")
+
+
+def write_record(record: dict, today: date, f, start: float, count: int) -> tuple[date, object]:
     now = date.today()
     if now != today:
         f.close()
         today, f = open_log_file(now)
     f.write(json.dumps(record) + "\n")
     f.flush()
-    elapsed_ms = (time.monotonic() - start) * 1000
+    if count == 1:
+        print(
+            f"\n  {style('Started watching', BOLD)} @ {fmt_now()}\n",
+            flush=True,
+        )
     n = len(record.get("processes", []))
+    ts = style(f"[{fmt_ts(record['timestamp'])}]", BRIGHT_BLACK)
+    sample = style(f"(sample {count})", CYAN)
     print(
-        f"[{record['timestamp']}] captured {n} processes → {f.name} in {elapsed_ms:.0f}ms",
+        f"  {ts} {sample} {n} processes \u2192 {f.name}",
         file=sys.stdout,
         flush=True,
     )
@@ -186,6 +229,8 @@ def write_record(record: dict, today: date, f, start: float) -> tuple[date, obje
 
 
 def main() -> None:
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--top", type=int, default=0,
@@ -196,6 +241,7 @@ def main() -> None:
     today, f = open_log_file(date.today())
     buf: list[str] = []
     sample_sep = re.compile(r"^\*\*\* Sampled system activity")
+    count = 0
 
     try:
         t0 = time.monotonic()
@@ -206,7 +252,8 @@ def main() -> None:
             if sample_sep.match(line) and buf:
                 record = flush_sample(buf, args.top)
                 if record:
-                    today, f = write_record(record, today, f, t0)
+                    count += 1
+                    today, f = write_record(record, today, f, t0, count)
                 buf = []
                 t0 = time.monotonic()
             buf.append(line)
@@ -214,9 +261,12 @@ def main() -> None:
         if buf:
             record = flush_sample(buf, args.top)
             if record:
-                today, f = write_record(record, today, f, t0)
+                count += 1
+                today, f = write_record(record, today, f, t0, count)
     finally:
         f.close()
+        if count:
+            print(f"\n  {style('Done.', BOLD)} {count} samples collected.", flush=True)
 
 
 if __name__ == "__main__":

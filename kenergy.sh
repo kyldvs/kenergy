@@ -18,7 +18,7 @@ cmd_watch() {
     echo "To collect accurate energy information we need to run with sudo:"
     echo "  sudo powermetrics --show-process-energy -i $interval"
     echo ""
-    sudo powermetrics --show-process-energy -i "$interval" \
+    sudo powermetrics --show-process-energy -i "$interval" 2>/dev/null \
         | python3 "$KENERGY_DIR/parse-powermetrics.py" --top "$top"
 }
 

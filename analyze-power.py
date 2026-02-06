@@ -16,6 +16,131 @@ from pathlib import Path
 
 LOG_DIR = Path.home() / "kenergy" / "logs"
 
+# ── ANSI helpers ────────────────────────────────────────────────────
+
+_USE_COLOR = sys.stdout.isatty()
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def style(text: str, *codes: str) -> str:
+    if not _USE_COLOR or not codes:
+        return str(text)
+    return "".join(codes) + str(text) + RESET
+
+
+def visible_len(s: str) -> int:
+    return len(_ANSI_RE.sub("", s))
+
+
+# ── Formatting helpers ──────────────────────────────────────────────
+
+
+def fmt_mw(mw: float) -> str:
+    if mw >= 1000:
+        return f"{mw / 1000:.1f}W"
+    return f"{mw:.0f}mW"
+
+
+def fmt_duration(hours: float) -> str:
+    minutes = hours * 60
+    if minutes < 60:
+        return f"{minutes:.1f} min"
+    h = int(minutes // 60)
+    m = int(minutes % 60)
+    return f"{h}h {m}m"
+
+
+def _pad_cell(cell: str, width: int, align: str) -> str:
+    """Pad a (possibly styled) cell string to exact visible width."""
+    gap = width - visible_len(cell)
+    if align == ">":
+        return " " + " " * gap + cell + " "
+    return " " + cell + " " * gap + " "
+
+
+def print_box(title: str, lines: list[str]) -> None:
+    """Print free-form content in a bordered box with a title."""
+    inner = max(
+        *(visible_len(line) + 2 for line in lines),
+        visible_len(title) + 4,
+    )
+    title_vis = visible_len(title)
+    top = "┌─ " + style(title, BOLD, CYAN) + " " + "─" * (inner - title_vis - 3) + "┐"
+    bot = "└" + "─" * inner + "┘"
+    print(f"\n  {top}")
+    for line in lines:
+        gap = inner - visible_len(line) - 2
+        print(f"  │ {line}{' ' * gap} │")
+    print(f"  {bot}")
+
+
+def print_table(
+    title: str,
+    columns: list[tuple[str, str, int]],
+    rows: list[list[str]],
+) -> None:
+    """Print a bordered table with title, headers, and vertical bars.
+
+    columns: list of (header, align, min_width) where align is '<' or '>'.
+    rows:    list of lists of (possibly styled) cell strings.
+    """
+    widths = [max(len(hdr), min_w) for hdr, _, min_w in columns]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], visible_len(cell))
+
+    # Padded column widths: " content " = width + 2
+    pw = [w + 2 for w in widths]
+
+    # Ensure first column is wide enough for the title
+    title_vis = visible_len(title)
+    min_first = title_vis + 3  # "─ Title "
+    if pw[0] < min_first:
+        widths[0] += min_first - pw[0]
+        pw[0] = min_first
+
+    def h_line(left: str, mid: str, right: str) -> str:
+        return left + mid.join("─" * w for w in pw) + right
+
+    # Top border with embedded title
+    top = "┌─ " + style(title, BOLD, CYAN) + " " + "─" * (pw[0] - title_vis - 3)
+    for i in range(1, len(pw)):
+        top += "┬" + "─" * pw[i]
+    top += "┐"
+
+    # Header row
+    hdr = "│"
+    for i, (name, align, _) in enumerate(columns):
+        hdr += _pad_cell(style(name, DIM), widths[i], align) + "│"
+
+    sep = h_line("├", "┼", "┤")
+    bot = h_line("└", "┴", "┘")
+
+    print(f"\n  {top}")
+    print(f"  {hdr}")
+    print(f"  {sep}")
+    for row in rows:
+        line = "│"
+        for i in range(len(columns)):
+            cell = row[i] if i < len(row) else ""
+            line += _pad_cell(cell, widths[i], columns[i][1]) + "│"
+        print(f"  {line}")
+    print(f"  {bot}")
+
+
+# ── Data loading ────────────────────────────────────────────────────
+
+NOMINAL_VOLTAGE = 11.4  # 3-cell Li-ion nominal voltage
+
 
 def load_samples(date_str: str) -> list[dict]:
     path = LOG_DIR / f"{date_str}.jsonl"
@@ -27,9 +152,6 @@ def load_samples(date_str: str) -> list[dict]:
         if line.strip():
             samples.append(json.loads(line))
     return samples
-
-
-NOMINAL_VOLTAGE = 11.4  # 3-cell Li-ion nominal voltage
 
 
 def get_battery_capacity_wh() -> tuple[float, float] | None:
@@ -65,15 +187,14 @@ def parse_ts(ts: str) -> datetime | None:
     try:
         return datetime.strptime(ts, "%a %b %d %H:%M:%S %Y %z")
     except ValueError:
-        # Try with extra space for single-digit days
         try:
             return datetime.strptime(ts, "%a %b  %d %H:%M:%S %Y %z")
         except ValueError:
             return None
 
 
-def estimate_sample_interval_h(samples: list[dict]) -> float | None:
-    """Estimate the average interval between samples in hours."""
+def compute_duration_h(samples: list[dict]) -> float | None:
+    """Compute total collection duration in hours from first to last sample."""
     timestamps = []
     for s in samples:
         dt = parse_ts(s["timestamp"])
@@ -81,80 +202,105 @@ def estimate_sample_interval_h(samples: list[dict]) -> float | None:
             timestamps.append(dt)
     if len(timestamps) < 2:
         return None
-    total_seconds = (timestamps[-1] - timestamps[0]).total_seconds()
-    return total_seconds / (len(timestamps) - 1) / 3600
+    return (timestamps[-1] - timestamps[0]).total_seconds() / 3600
 
 
-def fmt_mw(mw: float) -> str:
-    if mw >= 1000:
-        return f"{mw / 1000:.1f}W"
-    return f"{mw:.0f}mW"
-
-
-def print_header(title: str) -> None:
-    print(f"\n{'─' * 60}")
-    print(f"  {title}")
-    print(f"{'─' * 60}")
+# ── Main analysis ───────────────────────────────────────────────────
 
 
 def analyze(date_str: str) -> None:
     samples = load_samples(date_str)
     n = len(samples)
+    duration_h = compute_duration_h(samples)
 
-    print(f"\n  Energy Report: {date_str}")
-    print(f"  {n} samples collected")
+    # Title
+    print()
+    print(f"  {style('Energy Report', BOLD)}  {date_str}")
+    detail = f"{n} samples"
+    if duration_h:
+        detail += f" over {fmt_duration(duration_h)}"
+    print(f"  {style(detail, DIM)}")
 
-    # Time range
     if n > 0:
-        print(f"  {samples[0]['timestamp']}  →  {samples[-1]['timestamp']}")
+        ts_start = parse_ts(samples[0]["timestamp"])
+        ts_end = parse_ts(samples[-1]["timestamp"])
+        if ts_start and ts_end:
+            print(f"  {style(ts_start.strftime('%H:%M:%S'), DIM)} {style('→', DIM)} {style(ts_end.strftime('%H:%M:%S'), DIM)}")
 
-    # Battery
+    # ── Battery ─────────────────────────────────────────────────
+
     cap = get_battery_capacity_wh()
     batteries = [s["battery_pct"] for s in samples if "battery_pct" in s]
+    charging = False
     if len(batteries) >= 2:
-        print_header("Battery")
         pct_start = batteries[0]
         pct_end = batteries[-1]
         pct_delta = pct_end - pct_start
-        print(f"  {pct_start:.0f}% → {pct_end:.0f}%  ({pct_delta:+.0f}%)")
+        charging = pct_delta > 0
+        delta_color = GREEN if pct_delta > 0 else (YELLOW if pct_delta < 0 else DIM)
 
+        box_lines = [
+            f"{pct_start:.0f}% \u2192 {pct_end:.0f}%  ({style(f'{pct_delta:+.0f}%', delta_color)})",
+        ]
         if cap:
             current_wh, design_wh = cap
             health = current_wh / design_wh * 100
             wh_start = current_wh * pct_start / 100
             wh_end = current_wh * pct_end / 100
-            wh_used = abs(wh_start - wh_end)
-            print(f"  {wh_start:.1f} Wh → {wh_end:.1f} Wh  ({wh_used:.1f} Wh consumed)")
-            print(f"  Capacity: {current_wh:.1f} Wh / {design_wh:.1f} Wh design  ({health:.0f}% health)")
+            wh_delta = abs(wh_start - wh_end)
+            label = "charged" if charging else "consumed"
+            box_lines.append(
+                f"{wh_start:.1f} Wh \u2192 {wh_end:.1f} Wh  ({style(f'{wh_delta:.1f} Wh {label}', delta_color)})"
+            )
+            health_color = GREEN if health >= 80 else (YELLOW if health >= 60 else RED)
+            box_lines.append(
+                f"Capacity: {current_wh:.1f} / {design_wh:.1f} Wh design  ({style(f'{health:.0f}% health', health_color)})"
+            )
+        print_box("Battery", box_lines)
 
-    # Power draw
-    interval_h = estimate_sample_interval_h(samples)
+    # ── Power Draw ──────────────────────────────────────────────
 
     cpu_vals = [s["power"]["cpu_mw"] for s in samples if "cpu_mw" in s.get("power", {})]
     gpu_vals = [s["power"]["gpu_mw"] for s in samples if "gpu_mw" in s.get("power", {})]
     combined = [s["power"]["combined_mw"] for s in samples if "combined_mw" in s.get("power", {})]
 
     if combined:
-        print_header("Power Draw (avg / peak)")
+        power_rows = []
         if cpu_vals:
-            print(f"  CPU:      {fmt_mw(sum(cpu_vals) / len(cpu_vals)):>8}  / {fmt_mw(max(cpu_vals)):>8}")
+            power_rows.append([
+                "CPU",
+                fmt_mw(sum(cpu_vals) / len(cpu_vals)),
+                fmt_mw(max(cpu_vals)),
+            ])
         if gpu_vals:
-            print(f"  GPU:      {fmt_mw(sum(gpu_vals) / len(gpu_vals)):>8}  / {fmt_mw(max(gpu_vals)):>8}")
-        print(f"  Combined: {fmt_mw(sum(combined) / len(combined)):>8}  / {fmt_mw(max(combined)):>8}")
+            power_rows.append([
+                "GPU",
+                fmt_mw(sum(gpu_vals) / len(gpu_vals)),
+                fmt_mw(max(gpu_vals)),
+            ])
+        power_rows.append([
+            style("Combined", BOLD),
+            style(fmt_mw(sum(combined) / len(combined)), BOLD),
+            style(fmt_mw(max(combined)), BOLD),
+        ])
+        print_table(
+            "Power Draw",
+            [("", "<", 10), ("Avg", ">", 8), ("Peak", ">", 8)],
+            power_rows,
+        )
 
-        if interval_h:
-            total_wh = sum(c / 1000 * interval_h for c in combined)
-            detail = f"  Total:    {total_wh:.1f} Wh over {len(combined)} samples"
-            if cap:
-                batt_pct = total_wh / cap[0] * 100
-                detail += f"  (~{batt_pct:.0f}% of battery)"
-            print(detail)
-            if cap:
-                avg_w = sum(combined) / len(combined) / 1000
-                hrs_to_empty = cap[0] / avg_w
-                print(f"  At avg draw, full battery lasts ~{hrs_to_empty:.1f}h")
+        if batteries and len(batteries) >= 2 and cap and duration_h and duration_h > 0:
+            pct_drained = batteries[0] - batteries[-1]
+            if pct_drained > 0:
+                actual_wh = cap[0] * pct_drained / 100
+                drain_rate_w = actual_wh / duration_h
+                hrs_to_empty = cap[0] / drain_rate_w
+                print()
+                print(f"  {style(f'{actual_wh:.1f} Wh', BOLD, YELLOW)} consumed in {fmt_duration(duration_h)}  ({pct_drained:.0f}% battery)")
+                print(f"  At this rate, full battery lasts {style(f'~{hrs_to_empty:.1f}h', BOLD)}")
 
-    # Top processes by total energy impact
+    # ── Top Processes ───────────────────────────────────────────
+
     totals: dict[str, float] = defaultdict(float)
     peaks: dict[str, float] = defaultdict(float)
     counts: dict[str, int] = defaultdict(int)
@@ -167,43 +313,84 @@ def analyze(date_str: str) -> None:
             counts[name] += 1
 
     if totals:
-        print_header("Top Processes by Total Energy Impact")
-        print(f"  {'Process':<35} {'Total':>8} {'Avg':>8} {'Peak':>8} {'Seen':>5}")
         ranked = sorted(totals.items(), key=lambda x: x[1], reverse=True)[:15]
+        top_total = ranked[0][1] if ranked else 1
+        proc_rows = []
         for name, total in ranked:
             avg = total / counts[name]
-            print(f"  {name:<35} {total:>8.1f} {avg:>8.1f} {peaks[name]:>8.1f} {counts[name]:>5}")
+            # Color intensity by relative energy impact
+            if total > top_total * 0.5:
+                name_styled = style(name, BOLD, RED)
+            elif total > top_total * 0.2:
+                name_styled = style(name, YELLOW)
+            else:
+                name_styled = name
+            proc_rows.append([
+                name_styled,
+                f"{total:.0f}",
+                f"{avg:.1f}",
+                f"{peaks[name]:.1f}",
+                str(counts[name]),
+            ])
+        print_table(
+            "Top Processes",
+            [("Process", "<", 30), ("Total", ">", 8), ("Avg", ">", 8), ("Peak", ">", 8), ("Seen", ">", 5)],
+            proc_rows,
+        )
 
-    # Hourly power breakdown
+    # ── Hourly Power ────────────────────────────────────────────
+
     if combined:
         hourly: dict[str, list[float]] = defaultdict(list)
+        hourly_battery: dict[str, tuple[float, float]] = {}
         for s in samples:
-            ts = s["timestamp"]
-            # Extract hour from timestamp like "Fri Feb  6 10:46:32 2026 -0800"
-            parts = ts.split()
-            if len(parts) >= 4:
-                hour = parts[3].split(":")[0]
-                if "combined_mw" in s.get("power", {}):
-                    hourly[hour].append(s["power"]["combined_mw"])
+            dt = parse_ts(s["timestamp"])
+            if not dt:
+                continue
+            hour = f"{dt.hour:02d}"
+            if "combined_mw" in s.get("power", {}):
+                hourly[hour].append(s["power"]["combined_mw"])
+            if "battery_pct" in s:
+                pct = s["battery_pct"]
+                if hour not in hourly_battery:
+                    hourly_battery[hour] = (pct, pct)
+                else:
+                    hourly_battery[hour] = (hourly_battery[hour][0], pct)
 
-        if hourly and interval_h:
-            has_cap = cap is not None
-            print_header("Hourly Combined Power")
-            hdr = f"  {'Hour':>6}  {'Avg':>8}  {'Peak':>8}  {'~Wh':>6}"
-            if has_cap:
-                hdr += f"  {'~Batt%':>6}"
-            hdr += f"  {'Samples':>8}"
-            print(hdr)
+        if hourly:
+            draining = batteries and len(batteries) >= 2 and batteries[0] > batteries[-1]
+            has_battery = bool(hourly_battery) and cap is not None and draining
+
+            cols: list[tuple[str, str, int]] = [
+                ("Hour", "<", 6),
+                ("Avg", ">", 8),
+                ("Peak", ">", 8),
+            ]
+            if has_battery:
+                cols += [("~Wh", ">", 6), ("~Batt%", ">", 6)]
+            cols.append(("Samples", ">", 7))
+
+            hour_rows = []
             for hour in sorted(hourly.keys()):
                 vals = hourly[hour]
                 avg = sum(vals) / len(vals)
-                wh = sum(v / 1000 * interval_h for v in vals)
-                row = f"  {hour + ':00':>6}  {fmt_mw(avg):>8}  {fmt_mw(max(vals)):>8}  {wh:>5.1f}"
-                if has_cap:
-                    batt_pct = wh / cap[0] * 100
-                    row += f"  {batt_pct:>5.1f}%"
-                row += f"  {len(vals):>8}"
-                print(row)
+                row = [
+                    hour + ":00",
+                    fmt_mw(avg),
+                    fmt_mw(max(vals)),
+                ]
+                if has_battery:
+                    if hour in hourly_battery:
+                        first_pct, last_pct = hourly_battery[hour]
+                        pct_used = first_pct - last_pct
+                        wh = cap[0] * pct_used / 100
+                    else:
+                        wh = 0.0
+                        pct_used = 0.0
+                    row += [f"{wh:.1f}", f"{pct_used:.1f}%"]
+                row.append(str(len(vals)))
+                hour_rows.append(row)
+            print_table("Hourly Power", cols, hour_rows)
 
     print()
 
