@@ -8,7 +8,7 @@ usage() {
     echo ""
     echo "Commands:"
     echo "  watch [top] [interval_ms]   Start collecting energy metrics (default: top 20, 5000ms)"
-    echo "  analyze [YYYY-MM-DD]        Analyze a day's energy log (default: today)"
+    echo "  analyze [-Xhrs|YYYY-MM-DD]  Analyze energy log (default: last 2 hours)"
     exit 1
 }
 
@@ -23,8 +23,7 @@ cmd_watch() {
 }
 
 cmd_analyze() {
-    local date_str="${1:-$(date +%Y-%m-%d)}"
-    python3 "$KENERGY_DIR/analyze-power.py" "$date_str"
+    python3 "$KENERGY_DIR/analyze-power.py" "$@"
 }
 
 if [[ $# -lt 1 ]]; then

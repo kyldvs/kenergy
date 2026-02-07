@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Analyze a day's energy log and print a summary.
+"""Analyze energy logs and print a summary.
 
 Usage:
-    python3 analyze-power.py              # today
+    python3 analyze-power.py              # last 2 hours (default)
+    python3 analyze-power.py -4hrs        # last 4 hours
     python3 analyze-power.py 2026-02-06   # specific date
 """
 
@@ -11,7 +12,7 @@ import json
 import re
 import subprocess
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 LOG_DIR = Path.home() / "kenergy" / "logs"
@@ -154,6 +155,35 @@ def load_samples(date_str: str) -> list[dict]:
     return samples
 
 
+def load_recent_samples(hours: float) -> list[dict]:
+    """Load samples from the last N hours across date boundaries."""
+    now = datetime.now().astimezone()
+    cutoff = now - timedelta(hours=hours)
+
+    dates_to_check: list[str] = []
+    d = cutoff.date()
+    while d <= now.date():
+        dates_to_check.append(d.isoformat())
+        d += timedelta(days=1)
+
+    samples = []
+    for date_str in dates_to_check:
+        path = LOG_DIR / f"{date_str}.jsonl"
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            if line.strip():
+                s = json.loads(line)
+                ts = parse_ts(s.get("timestamp", ""))
+                if ts and ts >= cutoff:
+                    samples.append(s)
+
+    if not samples:
+        print(f"No samples found in the last {hours:g} hours.")
+        sys.exit(1)
+    return samples
+
+
 def get_battery_capacity_wh() -> tuple[float, float] | None:
     """Query ioreg for battery capacity. Returns (current_wh, design_wh) or None."""
     try:
@@ -208,14 +238,13 @@ def compute_duration_h(samples: list[dict]) -> float | None:
 # ── Main analysis ───────────────────────────────────────────────────
 
 
-def analyze(date_str: str) -> None:
-    samples = load_samples(date_str)
+def analyze(samples: list[dict], label: str) -> None:
     n = len(samples)
     duration_h = compute_duration_h(samples)
 
     # Title
     print()
-    print(f"  {style('Energy Report', BOLD)}  {date_str}")
+    print(f"  {style('Energy Report', BOLD)}  {label}")
     detail = f"{n} samples"
     if duration_h:
         detail += f" over {fmt_duration(duration_h)}"
@@ -231,27 +260,47 @@ def analyze(date_str: str) -> None:
 
     cap = get_battery_capacity_wh()
     batteries = [s["battery_pct"] for s in samples if "battery_pct" in s]
-    charging = False
     if len(batteries) >= 2:
         pct_start = batteries[0]
         pct_end = batteries[-1]
         pct_delta = pct_end - pct_start
-        charging = pct_delta > 0
         delta_color = GREEN if pct_delta > 0 else (YELLOW if pct_delta < 0 else DIM)
+
+        # Walk consecutive readings to accumulate total charged / discharged
+        total_charged_pct = 0.0
+        total_drained_pct = 0.0
+        for prev, cur in zip(batteries, batteries[1:]):
+            diff = cur - prev
+            if diff > 0:
+                total_charged_pct += diff
+            elif diff < 0:
+                total_drained_pct += -diff
 
         box_lines = [
             f"{pct_start:.0f}% \u2192 {pct_end:.0f}%  ({style(f'{pct_delta:+.0f}%', delta_color)})",
         ]
+
+        # Show total charged / drained when there's activity
+        cycle_parts = []
+        if total_charged_pct > 0:
+            cycle_parts.append(style(f"+{total_charged_pct:.0f}% charged", GREEN))
+        if total_drained_pct > 0:
+            cycle_parts.append(style(f"-{total_drained_pct:.0f}% drained", YELLOW))
+        if cycle_parts:
+            box_lines.append("  ".join(cycle_parts))
+
         if cap:
             current_wh, design_wh = cap
             health = current_wh / design_wh * 100
-            wh_start = current_wh * pct_start / 100
-            wh_end = current_wh * pct_end / 100
-            wh_delta = abs(wh_start - wh_end)
-            label = "charged" if charging else "consumed"
-            box_lines.append(
-                f"{wh_start:.1f} Wh \u2192 {wh_end:.1f} Wh  ({style(f'{wh_delta:.1f} Wh {label}', delta_color)})"
-            )
+            wh_charged = current_wh * total_charged_pct / 100
+            wh_drained = current_wh * total_drained_pct / 100
+            wh_parts = []
+            if wh_charged > 0:
+                wh_parts.append(style(f"+{wh_charged:.1f} Wh charged", GREEN))
+            if wh_drained > 0:
+                wh_parts.append(style(f"-{wh_drained:.1f} Wh drained", YELLOW))
+            if wh_parts:
+                box_lines.append("  ".join(wh_parts))
             health_color = GREEN if health >= 80 else (YELLOW if health >= 60 else RED)
             box_lines.append(
                 f"Capacity: {current_wh:.1f} / {design_wh:.1f} Wh design  ({style(f'{health:.0f}% health', health_color)})"
@@ -290,13 +339,12 @@ def analyze(date_str: str) -> None:
         )
 
         if batteries and len(batteries) >= 2 and cap and duration_h and duration_h > 0:
-            pct_drained = batteries[0] - batteries[-1]
-            if pct_drained > 0:
-                actual_wh = cap[0] * pct_drained / 100
+            if total_drained_pct > 0:
+                actual_wh = cap[0] * total_drained_pct / 100
                 drain_rate_w = actual_wh / duration_h
                 hrs_to_empty = cap[0] / drain_rate_w
                 print()
-                print(f"  {style(f'{actual_wh:.1f} Wh', BOLD, YELLOW)} consumed in {fmt_duration(duration_h)}  ({pct_drained:.0f}% battery)")
+                print(f"  {style(f'{actual_wh:.1f} Wh', BOLD, YELLOW)} drained in {fmt_duration(duration_h)}  ({total_drained_pct:.0f}% battery)")
                 print(f"  At this rate, full battery lasts {style(f'~{hrs_to_empty:.1f}h', BOLD)}")
 
     # ── Top Processes ───────────────────────────────────────────
@@ -396,5 +444,24 @@ def analyze(date_str: str) -> None:
 
 
 if __name__ == "__main__":
-    date_str = sys.argv[1] if len(sys.argv) > 1 else __import__("datetime").date.today().isoformat()
-    analyze(date_str)
+    if len(sys.argv) < 2:
+        # Default: last 2 hours
+        samples = load_recent_samples(2.0)
+        analyze(samples, "Last 2 hours")
+    else:
+        arg = sys.argv[1]
+        # -Xhrs or -Xhr pattern (e.g. -3hrs, -1.5hr)
+        m = re.match(r"^-?(\d+(?:\.\d+)?)hrs?$", arg)
+        if m:
+            hours = float(m.group(1))
+            samples = load_recent_samples(hours)
+            label = f"Last {hours:g} hour{'s' if hours != 1 else ''}"
+            analyze(samples, label)
+        # YYYY-MM-DD date
+        elif re.match(r"^\d{4}-\d{2}-\d{2}$", arg):
+            samples = load_samples(arg)
+            analyze(samples, arg)
+        else:
+            print(f"Invalid argument: {arg}")
+            print("Usage: kenergy analyze [-Xhrs | YYYY-MM-DD]")
+            sys.exit(1)
